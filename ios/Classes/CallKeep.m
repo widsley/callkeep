@@ -7,8 +7,45 @@
 //
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CommonCrypto/CommonDigest.h>
 
 #import "CallKeep.h"
+
+// COM-283: payload の値を安全に文字列へ正規化する。nil / NSNull / 非文字列でも
+// 落とさない。不正 payload 1 通で reportNewIncomingCall が呼ばれないと、
+// iOS 13+ ではアプリが強制終了され、以後 VoIP push の配送自体が停止されるため。
+static NSString * _Nullable CKAsNonEmptyString(id value) {
+    if ([value isKindOfClass:[NSString class]]) {
+        return ((NSString *)value).length > 0 ? value : nil;
+    }
+    if ([value isKindOfClass:[NSNumber class]]) {
+        return [value stringValue];
+    }
+    return nil;
+}
+
+// COM-283: sequenceId から決定的に UUID v5（RFC 4122, URL 名前空間）を生成する。
+// サーバーの VoIP payload に uuid は含まれないため、CallKit へ渡す UUID を
+// sequenceId から導出する。Dart 側 IncomingPushPayload の
+// Uuid().v5(Namespace.url, sequenceId) と同一値になるため、再配送の重複を
+// CallKit 自身が排除でき、終話系の照合も層をまたいで一致する。
+static NSString *CKUuidV5FromSequenceId(NSString *sequenceId) {
+    // RFC 4122 URL 名前空間 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+    const uint8_t ns[16] = {0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
+                            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8};
+    NSMutableData *input = [NSMutableData dataWithBytes:ns length:16];
+    [input appendData:[sequenceId dataUsingEncoding:NSUTF8StringEncoding]];
+    uint8_t digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(input.bytes, (CC_LONG)input.length, digest);
+    uint8_t uuid[16];
+    memcpy(uuid, digest, 16);
+    uuid[6] = (uuid[6] & 0x0F) | 0x50; // version 5
+    uuid[8] = (uuid[8] & 0x3F) | 0x80; // RFC 4122 variant
+    return [NSString stringWithFormat:
+            @"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+            uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]];
+}
 
 @implementation CallKeep
 {
@@ -231,38 +268,45 @@ static NSObject<CallKeepPushDelegate>* _delegate;
      */
     
     NSDictionary *dic = payload.dictionaryPayload;
-    
+
     if (_delegate) {
         dic = [_delegate mapPushPayload:dic];
     }
-    
-    // if (!dic || dic[@"aps"] != nil) {
-    //     NSLog(@"Do not use the 'alert' format for push type %@.", payload.type);
-    //     if(completion != nil) {
-    //         completion();
-    //     }
-    //     return;
-    // }
-    
-    NSString *uuid = dic[@"uuid"];
-    NSString *sequenceId = dic[@"data"][@"sequenceId"];
-    NSString *displayName = dic[@"data"][@"displayName"];
-    BOOL hasVideo = [dic[@"data"][@"hasVideo"] boolValue];
-    // NSString *callerIdType = dic[@"caller_id_type"];
-    NSString *callerIdType = @"generic";
-    
-    
-    if( uuid == nil) {
-        uuid = [self createUUID];
+    // COM-283: delegate が nil を返しても着信報告は必須（iOS 13+ の規約）。
+    if (![dic isKindOfClass:[NSDictionary class]]) {
+        dic = @{};
     }
-    
+
+    // COM-283: 現行サーバー形式は {"data": {...}} のみ（uuid や aps alert は
+    // 含まれない）。data が辞書でない場合は旧形式（トップレベルにフラット）へ
+    // フォールバックして読む。
+    NSDictionary *data = [dic[@"data"] isKindOfClass:[NSDictionary class]]
+        ? dic[@"data"]
+        : dic;
+
+    NSString *sequenceId = CKAsNonEmptyString(data[@"sequenceId"]);
+    NSString *displayName = CKAsNonEmptyString(data[@"displayName"]);
+    id hasVideoRaw = data[@"hasVideo"];
+    BOOL hasVideo =
+        ([hasVideoRaw isKindOfClass:[NSNumber class]] && [hasVideoRaw boolValue]) ||
+        ([hasVideoRaw isKindOfClass:[NSString class]] &&
+         [[hasVideoRaw lowercaseString] isEqualToString:@"true"]);
+    NSString *callerIdType = @"generic";
+
+    // COM-283: uuid は payload に無いのが通常。sequenceId があればそれから
+    // 決定的に導出し（Dart 側と同一の UUID v5）、無ければローカルで採番する。
+    NSString *uuid = CKAsNonEmptyString(dic[@"uuid"]);
+    if (uuid == nil) {
+        uuid = sequenceId != nil ? CKUuidV5FromSequenceId(sequenceId) : [self createUUID];
+    }
+
     NSLog(@"Got here %@.", [dic description]);
-    
+
     [CallKeep reportNewIncomingCall:uuid
-                             handle:sequenceId
+                             handle:sequenceId ?: @"anonymous"
                          handleType:callerIdType
                            hasVideo:hasVideo
-                         callerName:displayName
+                         callerName:displayName ?: @"Anonymous"
                         fromPushKit:YES
                             payload:dic
               withCompletionHandler:completion];
@@ -579,21 +623,30 @@ static NSObject<CallKeepPushDelegate>* _delegate;
     NSLog(@"[CallKeep][reportNewIncomingCall] uuidString = %@", uuidString);
 #endif
     [CallKeep initCallKitProvider];
-    
+
     int _handleType = [CallKeep getHandleType:handleType];
-    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
-    
+    // COM-283: 不正な UUID 文字列だと NSUUID が nil になり
+    // reportNewIncomingCallWithUUID: がクラッシュするため、必ず有効値に落とす。
+    NSUUID *uuid = uuidString != nil ? [[NSUUID alloc] initWithUUIDString:uuidString] : nil;
+    if (uuid == nil) {
+        uuid = [NSUUID UUID];
+        uuidString = [uuid UUIDString].lowercaseString;
+    }
+    // COM-283: CXHandle の value と イベント辞書は nil 不可（クラッシュする）。
+    NSString *safeHandle = handle ?: @"anonymous";
+    NSString *reportedUuid = uuidString;
+
     CXCallUpdate *callUpdate = [CallKeep createCallUpdate];
-    callUpdate.remoteHandle = [[CXHandle alloc] initWithType:_handleType value:handle];
+    callUpdate.remoteHandle = [[CXHandle alloc] initWithType:_handleType value:safeHandle];
     callUpdate.hasVideo = hasVideo;
     callUpdate.localizedCallerName = callerName;
-    
+
     [sharedProvider reportNewIncomingCallWithUUID:uuid update:callUpdate completion:^(NSError * _Nullable error) {
         CallKeep *callKeep = [CallKeep allocWithZone: nil];
         [callKeep sendEventWithNameWrapper:CallKeepDidDisplayIncomingCall body:@{
             @"error": error && error.localizedDescription ? error.localizedDescription : @"",
-            @"callUUID": uuidString,
-            @"handle": handle,
+            @"callUUID": reportedUuid,
+            @"handle": safeHandle,
             @"name": callerName ? callerName : @"",
             @"hasVideo": @(hasVideo),
             @"fromPushKit": @(fromPushKit),
