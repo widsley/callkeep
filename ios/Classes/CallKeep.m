@@ -47,6 +47,62 @@ static NSString *CKUuidV5FromSequenceId(NSString *sequenceId) {
             uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]];
 }
 
+// COM-556: Objective-C port of lib/utility/caller_number_parser.dart (the
+// Kotlin twin is CallerNumberParser.kt). The push has no caller-number field;
+// the number only exists inside the free-text displayName the PBX builds:
+//   "[widsley-dev] 外線 (0649802288着信) 07012345678"  → 07012345678
+//   "InboundDial 0312341234"                             → 0312341234
+//   "[purwokerto] 内線 uzumaki69.un"                     → nil (no number)
+// Rules (keep identical across the three ports, pinned by the shared vectors
+// in com556_caller_number_parser_test.dart):
+//  1. drop every "(…着信)" group — that is the called line, not the caller
+//  2. take the LAST run of digits (optional leading '+')
+//  3. normalize like normalizeTelForCustomerSearch: "+81"/"81…" → "0…",
+//     add a leading "0", reject anything shorter than 10 digits
+// The result becomes the CXHandle (type phoneNumber), i.e. the number iOS
+// shows in Recents and dials back when the entry is tapped. Before COM-556
+// the handle was the sequenceId (an internal UUID, type generic), which
+// Recents showed as a "Social profile" that could not be called back.
+static NSString * _Nullable CKCallerNumberFromDisplayName(NSString * _Nullable displayName) {
+    if (displayName == nil || displayName.length == 0) {
+        return nil;
+    }
+    NSRegularExpression *calledLine =
+        [NSRegularExpression regularExpressionWithPattern:@"\\([^()]*着信\\)" options:0 error:nil];
+    NSString *withoutCalledLine =
+        [calledLine stringByReplacingMatchesInString:displayName
+                                             options:0
+                                               range:NSMakeRange(0, displayName.length)
+                                        withTemplate:@" "];
+    NSRegularExpression *digitRun =
+        [NSRegularExpression regularExpressionWithPattern:@"\\+?[0-9]+" options:0 error:nil];
+    NSArray<NSTextCheckingResult *> *runs =
+        [digitRun matchesInString:withoutCalledLine
+                          options:0
+                            range:NSMakeRange(0, withoutCalledLine.length)];
+    if (runs.count == 0) {
+        return nil;
+    }
+    NSString *last = [withoutCalledLine substringWithRange:runs.lastObject.range];
+    NSMutableString *digits = [NSMutableString string];
+    for (NSUInteger i = 0; i < last.length; i++) {
+        unichar c = [last characterAtIndex:i];
+        if (c >= '0' && c <= '9') {
+            [digits appendFormat:@"%C", c];
+        }
+    }
+    if (digits.length == 0) {
+        return nil;
+    }
+    NSString *normalized = digits;
+    if ([normalized hasPrefix:@"81"] && normalized.length >= 11) {
+        normalized = [@"0" stringByAppendingString:[normalized substringFromIndex:2]];
+    } else if (![normalized hasPrefix:@"0"]) {
+        normalized = [@"0" stringByAppendingString:normalized];
+    }
+    return normalized.length < 10 ? nil : normalized;
+}
+
 @implementation CallKeep
 {
     NSOperatingSystemVersion _version;
@@ -291,7 +347,13 @@ static NSObject<CallKeepPushDelegate>* _delegate;
         ([hasVideoRaw isKindOfClass:[NSNumber class]] && [hasVideoRaw boolValue]) ||
         ([hasVideoRaw isKindOfClass:[NSString class]] &&
          [[hasVideoRaw lowercaseString] isEqualToString:@"true"]);
-    NSString *callerIdType = @"generic";
+    // COM-556: the handle is what Recents stores as the counterpart and dials
+    // back on tap. Use the caller's number (type "number") when displayName
+    // carries one; for internal calls, which have no number, fall back to the
+    // display text with type "generic" — never the sequenceId.
+    NSString *callerNumber = CKCallerNumberFromDisplayName(displayName);
+    NSString *callHandle = callerNumber ?: (displayName ?: @"anonymous");
+    NSString *callerIdType = callerNumber != nil ? @"number" : @"generic";
 
     // COM-283: uuid は payload に無いのが通常。sequenceId があればそれから
     // 決定的に導出し（Dart 側と同一の UUID v5）、無ければローカルで採番する。
@@ -303,7 +365,7 @@ static NSObject<CallKeepPushDelegate>* _delegate;
     NSLog(@"Got here %@.", [dic description]);
 
     [CallKeep reportNewIncomingCall:uuid
-                             handle:sequenceId ?: @"anonymous"
+                             handle:callHandle
                          handleType:callerIdType
                            hasVideo:hasVideo
                          callerName:displayName ?: @"Anonymous"
