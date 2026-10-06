@@ -57,8 +57,13 @@ static NSString *CKUuidV5FromSequenceId(NSString *sequenceId) {
 // in com556_caller_number_parser_test.dart):
 //  1. drop every "(…着信)" group — that is the called line, not the caller
 //  2. take the LAST run of digits (optional leading '+')
-//  3. normalize like normalizeTelForCustomerSearch: "+81"/"81…" → "0…",
-//     add a leading "0", reject anything shorter than 10 digits
+//  3. accept only numbers that are clearly Japanese: "+81"/"81…" → "0…",
+//     otherwise the run must already start with "0"; 10 or 11 digits after
+//     normalization. Anything else returns nil so the call falls back to the
+//     generic handle with the display text (the internal-call path). Unlike
+//     normalizeTelForCustomerSearch, no leading "0" is guessed: a guessed
+//     number would be dialled back from Recents, a missed match only hides
+//     the customer name.
 // The result becomes the CXHandle (type phoneNumber), i.e. the number iOS
 // shows in Recents and dials back when the entry is tapped. Before COM-556
 // the handle was the sequenceId (an internal UUID, type generic), which
@@ -98,9 +103,9 @@ static NSString * _Nullable CKCallerNumberFromDisplayName(NSString * _Nullable d
     if ([normalized hasPrefix:@"81"] && normalized.length >= 11) {
         normalized = [@"0" stringByAppendingString:[normalized substringFromIndex:2]];
     } else if (![normalized hasPrefix:@"0"]) {
-        normalized = [@"0" stringByAppendingString:normalized];
+        return nil;
     }
-    return normalized.length < 10 ? nil : normalized;
+    return (normalized.length < 10 || normalized.length > 11) ? nil : normalized;
 }
 
 @implementation CallKeep
