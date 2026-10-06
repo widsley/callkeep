@@ -7,8 +7,106 @@
 //
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CommonCrypto/CommonDigest.h>
 
 #import "CallKeep.h"
+
+// COM-283: payload の値を安全に文字列へ正規化する。nil / NSNull / 非文字列でも
+// 落とさない。不正 payload 1 通で reportNewIncomingCall が呼ばれないと、
+// iOS 13+ ではアプリが強制終了され、以後 VoIP push の配送自体が停止されるため。
+static NSString * _Nullable CKAsNonEmptyString(id value) {
+    if ([value isKindOfClass:[NSString class]]) {
+        return ((NSString *)value).length > 0 ? value : nil;
+    }
+    if ([value isKindOfClass:[NSNumber class]]) {
+        return [value stringValue];
+    }
+    return nil;
+}
+
+// COM-283: sequenceId から決定的に UUID v5（RFC 4122, URL 名前空間）を生成する。
+// サーバーの VoIP payload に uuid は含まれないため、CallKit へ渡す UUID を
+// sequenceId から導出する。Dart 側 IncomingPushPayload の
+// Uuid().v5(Namespace.url, sequenceId) と同一値になるため、再配送の重複を
+// CallKit 自身が排除でき、終話系の照合も層をまたいで一致する。
+static NSString *CKUuidV5FromSequenceId(NSString *sequenceId) {
+    // RFC 4122 URL 名前空間 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+    const uint8_t ns[16] = {0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
+                            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8};
+    NSMutableData *input = [NSMutableData dataWithBytes:ns length:16];
+    [input appendData:[sequenceId dataUsingEncoding:NSUTF8StringEncoding]];
+    uint8_t digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(input.bytes, (CC_LONG)input.length, digest);
+    uint8_t uuid[16];
+    memcpy(uuid, digest, 16);
+    uuid[6] = (uuid[6] & 0x0F) | 0x50; // version 5
+    uuid[8] = (uuid[8] & 0x3F) | 0x80; // RFC 4122 variant
+    return [NSString stringWithFormat:
+            @"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+            uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]];
+}
+
+// COM-556: Objective-C port of lib/utility/caller_number_parser.dart (the
+// Kotlin twin is CallerNumberParser.kt). The push has no caller-number field;
+// the number only exists inside the free-text displayName the PBX builds:
+//   "[widsley-dev] 外線 (0649802288着信) 07012345678"  → 07012345678
+//   "InboundDial 0312341234"                             → 0312341234
+//   "[purwokerto] 内線 uzumaki69.un"                     → nil (no number)
+// Rules (keep identical across the three ports, pinned by the shared vectors
+// in com556_caller_number_parser_test.dart):
+//  1. drop every "(…着信)" group — that is the called line, not the caller
+//  2. take the LAST run of digits (optional leading '+')
+//  3. accept only numbers that are clearly Japanese: "+81"/"81…" → "0…",
+//     otherwise the run must already start with "0"; 10 or 11 digits after
+//     normalization. Anything else returns nil so the call falls back to the
+//     generic handle with the display text (the internal-call path). Unlike
+//     normalizeTelForCustomerSearch, no leading "0" is guessed: a guessed
+//     number would be dialled back from Recents, a missed match only hides
+//     the customer name.
+// The result becomes the CXHandle (type phoneNumber), i.e. the number iOS
+// shows in Recents and dials back when the entry is tapped. Before COM-556
+// the handle was the sequenceId (an internal UUID, type generic), which
+// Recents showed as a "Social profile" that could not be called back.
+static NSString * _Nullable CKCallerNumberFromDisplayName(NSString * _Nullable displayName) {
+    if (displayName == nil || displayName.length == 0) {
+        return nil;
+    }
+    NSRegularExpression *calledLine =
+        [NSRegularExpression regularExpressionWithPattern:@"\\([^()]*着信\\)" options:0 error:nil];
+    NSString *withoutCalledLine =
+        [calledLine stringByReplacingMatchesInString:displayName
+                                             options:0
+                                               range:NSMakeRange(0, displayName.length)
+                                        withTemplate:@" "];
+    NSRegularExpression *digitRun =
+        [NSRegularExpression regularExpressionWithPattern:@"\\+?[0-9]+" options:0 error:nil];
+    NSArray<NSTextCheckingResult *> *runs =
+        [digitRun matchesInString:withoutCalledLine
+                          options:0
+                            range:NSMakeRange(0, withoutCalledLine.length)];
+    if (runs.count == 0) {
+        return nil;
+    }
+    NSString *last = [withoutCalledLine substringWithRange:runs.lastObject.range];
+    NSMutableString *digits = [NSMutableString string];
+    for (NSUInteger i = 0; i < last.length; i++) {
+        unichar c = [last characterAtIndex:i];
+        if (c >= '0' && c <= '9') {
+            [digits appendFormat:@"%C", c];
+        }
+    }
+    if (digits.length == 0) {
+        return nil;
+    }
+    NSString *normalized = digits;
+    if ([normalized hasPrefix:@"81"] && normalized.length >= 11) {
+        normalized = [@"0" stringByAppendingString:[normalized substringFromIndex:2]];
+    } else if (![normalized hasPrefix:@"0"]) {
+        return nil;
+    }
+    return (normalized.length < 10 || normalized.length > 11) ? nil : normalized;
+}
 
 @implementation CallKeep
 {
@@ -231,37 +329,51 @@ static NSObject<CallKeepPushDelegate>* _delegate;
      */
     
     NSDictionary *dic = payload.dictionaryPayload;
-    
+
     if (_delegate) {
         dic = [_delegate mapPushPayload:dic];
     }
-    
-    if (!dic || dic[@"aps"] != nil) {
-        NSLog(@"Do not use the 'alert' format for push type %@.", payload.type);
-        if(completion != nil) {
-            completion();
-        }
-        return;
+    // COM-283: delegate が nil を返しても着信報告は必須（iOS 13+ の規約）。
+    if (![dic isKindOfClass:[NSDictionary class]]) {
+        dic = @{};
     }
-    
-    NSString *uuid = dic[@"uuid"];
-    NSString *callerId = dic[@"caller_id"];
-    NSString *callerName = dic[@"caller_name"];
-    BOOL hasVideo = [dic[@"has_video"] boolValue];
-    NSString *callerIdType = dic[@"caller_id_type"];
-    
-    
-    if( uuid == nil) {
-        uuid = [self createUUID];
+
+    // COM-283: 現行サーバー形式は {"data": {...}} のみ（uuid や aps alert は
+    // 含まれない）。data が辞書でない場合は旧形式（トップレベルにフラット）へ
+    // フォールバックして読む。
+    NSDictionary *data = [dic[@"data"] isKindOfClass:[NSDictionary class]]
+        ? dic[@"data"]
+        : dic;
+
+    NSString *sequenceId = CKAsNonEmptyString(data[@"sequenceId"]);
+    NSString *displayName = CKAsNonEmptyString(data[@"displayName"]);
+    id hasVideoRaw = data[@"hasVideo"];
+    BOOL hasVideo =
+        ([hasVideoRaw isKindOfClass:[NSNumber class]] && [hasVideoRaw boolValue]) ||
+        ([hasVideoRaw isKindOfClass:[NSString class]] &&
+         [[hasVideoRaw lowercaseString] isEqualToString:@"true"]);
+    // COM-556: the handle is what Recents stores as the counterpart and dials
+    // back on tap. Use the caller's number (type "number") when displayName
+    // carries one; for internal calls, which have no number, fall back to the
+    // display text with type "generic" — never the sequenceId.
+    NSString *callerNumber = CKCallerNumberFromDisplayName(displayName);
+    NSString *callHandle = callerNumber ?: (displayName ?: @"anonymous");
+    NSString *callerIdType = callerNumber != nil ? @"number" : @"generic";
+
+    // COM-283: uuid は payload に無いのが通常。sequenceId があればそれから
+    // 決定的に導出し（Dart 側と同一の UUID v5）、無ければローカルで採番する。
+    NSString *uuid = CKAsNonEmptyString(dic[@"uuid"]);
+    if (uuid == nil) {
+        uuid = sequenceId != nil ? CKUuidV5FromSequenceId(sequenceId) : [self createUUID];
     }
-    
+
     NSLog(@"Got here %@.", [dic description]);
-    
+
     [CallKeep reportNewIncomingCall:uuid
-                             handle:callerId
+                             handle:callHandle
                          handleType:callerIdType
                            hasVideo:hasVideo
-                         callerName:callerName
+                         callerName:displayName ?: @"Anonymous"
                         fromPushKit:YES
                             payload:dic
               withCompletionHandler:completion];
@@ -578,21 +690,30 @@ static NSObject<CallKeepPushDelegate>* _delegate;
     NSLog(@"[CallKeep][reportNewIncomingCall] uuidString = %@", uuidString);
 #endif
     [CallKeep initCallKitProvider];
-    
+
     int _handleType = [CallKeep getHandleType:handleType];
-    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
-    
+    // COM-283: 不正な UUID 文字列だと NSUUID が nil になり
+    // reportNewIncomingCallWithUUID: がクラッシュするため、必ず有効値に落とす。
+    NSUUID *uuid = uuidString != nil ? [[NSUUID alloc] initWithUUIDString:uuidString] : nil;
+    if (uuid == nil) {
+        uuid = [NSUUID UUID];
+        uuidString = [uuid UUIDString].lowercaseString;
+    }
+    // COM-283: CXHandle の value と イベント辞書は nil 不可（クラッシュする）。
+    NSString *safeHandle = handle ?: @"anonymous";
+    NSString *reportedUuid = uuidString;
+
     CXCallUpdate *callUpdate = [CallKeep createCallUpdate];
-    callUpdate.remoteHandle = [[CXHandle alloc] initWithType:_handleType value:handle];
+    callUpdate.remoteHandle = [[CXHandle alloc] initWithType:_handleType value:safeHandle];
     callUpdate.hasVideo = hasVideo;
     callUpdate.localizedCallerName = callerName;
-    
+
     [sharedProvider reportNewIncomingCallWithUUID:uuid update:callUpdate completion:^(NSError * _Nullable error) {
         CallKeep *callKeep = [CallKeep allocWithZone: nil];
         [callKeep sendEventWithNameWrapper:CallKeepDidDisplayIncomingCall body:@{
             @"error": error && error.localizedDescription ? error.localizedDescription : @"",
-            @"callUUID": uuidString,
-            @"handle": handle,
+            @"callUUID": reportedUuid,
+            @"handle": safeHandle,
             @"name": callerName ? callerName : @"",
             @"hasVideo": @(hasVideo),
             @"fromPushKit": @(fromPushKit),

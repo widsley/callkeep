@@ -18,7 +18,7 @@ dependencies:
     # the parent directory to use the current plugin's version.
     path: ../
 
-  firebase_messaging: ^15.2.0
+  firebase_messaging: ^16.0.3
   flutter:
     sdk: flutter
   logger: ^2.0.2+1
