@@ -108,6 +108,42 @@ static NSString * _Nullable CKCallerNumberFromDisplayName(NSString * _Nullable d
     return (normalized.length < 10 || normalized.length > 11) ? nil : normalized;
 }
 
+// P3-7 (CMR-1136): a token as logged — its first 8 characters and its length
+// only, the same shape as maskTokenForLog on the Dart side. Values of 8
+// characters or fewer show no characters at all.
+static NSString *CKMaskTokenForLog(NSString * _Nullable token) {
+    if (token.length == 0) {
+        return @"(none)";
+    }
+    NSString *head = token.length > 8 ? [token substringToIndex:8] : @"";
+    return [NSString stringWithFormat:@"%@… (%lu chars)", head, (unsigned long)token.length];
+}
+
+// P3-7 4a (CMR-1136): whether a push is a cancel. "action" is read from data
+// first, then from the top level (a blank value counts as absent), and
+// compared without surrounding whitespace and case — the same rule as
+// IncomingPushPayload on the Dart side. Anything else is a dial.
+static BOOL CKIsCancelPush(NSDictionary *data, NSDictionary *payload) {
+    NSCharacterSet *spaces = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    for (NSDictionary *source in @[data ?: @{}, payload ?: @{}]) {
+        NSString *action = [CKAsNonEmptyString(source[@"action"]) stringByTrimmingCharactersInSet:spaces];
+        if (action.length > 0) {
+            return [action.lowercaseString isEqualToString:@"cancel"];
+        }
+    }
+    return NO;
+}
+
+// P3-7 4a (CMR-1136): the CallKit call with this UUID that has not ended yet.
+static CXCall * _Nullable CKUnendedCall(CXCallObserver *observer, NSUUID *uuid) {
+    for (CXCall *call in observer.calls) {
+        if (!call.hasEnded && [call.UUID isEqual:uuid]) {
+            return call;
+        }
+    }
+    return nil;
+}
+
 @implementation CallKeep
 {
     NSOperatingSystemVersion _version;
@@ -302,7 +338,7 @@ static NSObject<CallKeepPushDelegate>* _delegate;
                           ntohl(tokenBytes[3]), ntohl(tokenBytes[4]), ntohl(tokenBytes[5]),
                           ntohl(tokenBytes[6]), ntohl(tokenBytes[7])];
     
-    NSLog(@"\n[VoIP Token]: %@\n\n",hexToken);
+    NSLog(@"[VoIP Token]: %@", CKMaskTokenForLog(hexToken));
     
     [self sendEventWithNameWrapper:CallKeepPushKitToken body:@{ @"token": hexToken }];
 }
@@ -312,6 +348,50 @@ static NSObject<CallKeepPushDelegate>* _delegate;
     NSString *uuidStr = (NSString *)CFBridgingRelease(CFUUIDCreateString(kCFAllocatorDefault, uuidObject));
     CFRelease(uuidObject);
     return [uuidStr lowercaseString];
+}
+
+// P3-7 4a (CMR-1136): a cancel push (design §1.6). A call already answered on
+// this device is left alone; a call still ringing is ended as a remote hang-up
+// without a new report. With no such call, the push is still reported (every
+// VoIP push must reach CallKit) and the call is ended right away; Dart gets the
+// usual display event and closes its side.
+- (void)endCancelledCall:(NSString *)uuidString
+                  handle:(NSString *)handle
+              handleType:(NSString *)handleType
+                hasVideo:(BOOL)hasVideo
+              callerName:(NSString *)callerName
+                 payload:(NSDictionary *)payload
+              completion:(void (^)(void))completion
+{
+    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
+    CXCallObserver *observer = self.callKeepCallController.callObserver ?: [[CXCallObserver alloc] init];
+    CXCall *call = uuid != nil ? CKUnendedCall(observer, uuid) : nil;
+    if (call.hasConnected) {
+        NSLog(@"[CallKeep] cancel push: ignored (connected)");
+        completion();
+        return;
+    }
+    if (call != nil) {
+        NSLog(@"[CallKeep] cancel push: ended ringing call");
+        [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonRemoteEnded];
+        completion();
+        return;
+    }
+    NSString *reportedUuid = uuid != nil ? uuidString : [self createUUID];
+    NSLog(@"[CallKeep] cancel push: reported and ended");
+    [CallKeep reportNewIncomingCall:reportedUuid
+                             handle:handle
+                         handleType:handleType
+                           hasVideo:hasVideo
+                         callerName:callerName
+                        fromPushKit:YES
+                            payload:payload
+              withCompletionHandler:^{
+        [sharedProvider reportCallWithUUID:[[NSUUID alloc] initWithUUIDString:reportedUuid]
+                               endedAtDate:[NSDate date]
+                                    reason:CXCallEndedReasonRemoteEnded];
+        completion();
+    }];
 }
 
 
@@ -366,8 +446,20 @@ static NSObject<CallKeepPushDelegate>* _delegate;
     if (uuid == nil) {
         uuid = sequenceId != nil ? CKUuidV5FromSequenceId(sequenceId) : [self createUUID];
     }
+    BOOL isCancel = CKIsCancelPush(data, dic);
 
-    NSLog(@"Got here %@.", [dic description]);
+    NSLog(@"[CallKeep] PushKit push: %@ %@", isCancel ? @"cancel" : @"dial", uuid);
+
+    if (isCancel) {
+        [self endCancelledCall:uuid
+                        handle:callHandle
+                    handleType:callerIdType
+                      hasVideo:hasVideo
+                    callerName:displayName ?: @"Anonymous"
+                       payload:dic
+                    completion:completion];
+        return;
+    }
 
     [CallKeep reportNewIncomingCall:uuid
                              handle:callHandle
